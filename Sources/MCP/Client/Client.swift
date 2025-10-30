@@ -691,18 +691,27 @@ public actor Client {
         // Find notification handlers for this method
         guard let handlers = notificationHandlers[message.method] else { return }
 
-        // Convert notification parameters to concrete type and call handlers
-        for handler in handlers {
-            do {
-                try await handler(message)
-            } catch {
-                await logger?.error(
-                    "Error handling notification",
-                    metadata: [
-                        "method": "\(message.method)",
-                        "error": "\(error)",
-                    ])
+        // Process all handlers concurrently using TaskGroup
+        await withTaskGroup(of: Void.self) { group in
+            for (index, handler) in handlers.enumerated() {
+                group.addTask {
+                    do {
+                        try await handler(message)
+                    } catch {
+                        await self.logger?.error(
+                            "Error handling notification",
+                            metadata: [
+                                "method": "\(message.method)",
+                                "handler_index": "\(index)",
+                                "error": "\(error)",
+                            ])
+                    }
+                }
             }
+
+            // Wait for all handlers to complete
+            // Note: We don't need to collect results since handlers return Void
+            for await _ in group {}
         }
     }
 
