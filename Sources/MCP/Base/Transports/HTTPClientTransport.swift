@@ -359,6 +359,16 @@ public actor HTTPClientTransport: Transport {
                 messageContinuation.yield(buffer)
             } else {
                 logger.warning("Unexpected content type: \(contentType)")
+                do {
+                    try await self.processSSE(stream)
+                } catch {
+                    var buffer = Data()
+                    for try await byte in stream {
+                        buffer.append(byte)
+                    }
+                    logger.trace("Received JSON response", metadata: ["size": "\(buffer.count)"])
+                    messageContinuation.yield(buffer)
+                }
             }
         }
     #endif
