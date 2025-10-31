@@ -32,9 +32,10 @@ import Logging
 /// ```swift
 /// import MCP
 ///
-/// // Create a streaming HTTP transport with bearer token authentication
+/// // Create a streaming HTTP transport with optimized configuration for real-time notifications
 /// let transport = HTTPClientTransport(
 ///     endpoint: URL(string: "https://api.example.com/mcp")!,
+///     configuration: HTTPClientTransport.optimizedStreamingConfiguration(),
 ///     requestModifier: { request in
 ///         var modifiedRequest = request
 ///         modifiedRequest.addValue("Bearer your-token-here", forHTTPHeaderField: "Authorization")
@@ -48,6 +49,13 @@ import Logging
 ///
 /// // The transport will automatically handle SSE events
 /// // and deliver them through the client's notification handlers
+///
+/// // For scenarios where you don't need to wait for session ID:
+/// let transport2 = HTTPClientTransport(
+///     endpoint: URL(string: "https://api.example.com/mcp")!,
+///     configuration: HTTPClientTransport.optimizedStreamingConfiguration(),
+///     waitForSessionId: false  // Useful for stateless servers
+/// )
 /// ```
 public actor HTTPClientTransport: Transport {
     /// The server endpoint URL to connect to
@@ -65,6 +73,9 @@ public actor HTTPClientTransport: Transport {
     /// Maximum time to wait for a session ID before proceeding with SSE connection
     public let sseInitializationTimeout: TimeInterval
 
+    /// Whether to wait for session ID before proceeding with SSE connection
+    public let shouldWaitForSessionId: Bool
+
     /// Closure to modify requests before they are sent
     private let requestModifier: (URLRequest) -> URLRequest
 
@@ -81,14 +92,16 @@ public actor HTTPClientTransport: Transport {
     ///   - endpoint: The server URL to connect to
     ///   - configuration: URLSession configuration to use for HTTP requests
     ///   - streaming: Whether to enable SSE streaming mode (default: true)
-    ///   - sseInitializationTimeout: Maximum time to wait for session ID before proceeding with SSE (default: 10 seconds)
+    ///   - sseInitializationTimeout: Maximum time to wait for session ID before proceeding with SSE (default: 0.5 seconds)
+    ///   - shouldWaitForSessionId: Whether to wait for session ID before proceeding with SSE connection (default: true)
     ///   - requestModifier: Optional closure to customize requests before they are sent (default: no modification)
     ///   - logger: Optional logger instance for transport events
     public init(
         endpoint: URL,
         configuration: URLSessionConfiguration = .default,
         streaming: Bool = true,
-        sseInitializationTimeout: TimeInterval = 10,
+        sseInitializationTimeout: TimeInterval = 0.5,
+        waitForSessionId: Bool = true,
         requestModifier: @escaping (URLRequest) -> URLRequest = { $0 },
         logger: Logger? = nil
     ) {
@@ -97,6 +110,7 @@ public actor HTTPClientTransport: Transport {
             session: URLSession(configuration: configuration),
             streaming: streaming,
             sseInitializationTimeout: sseInitializationTimeout,
+            waitForSessionId: waitForSessionId,
             requestModifier: requestModifier,
             logger: logger
         )
@@ -106,7 +120,8 @@ public actor HTTPClientTransport: Transport {
         endpoint: URL,
         session: URLSession,
         streaming: Bool = false,
-        sseInitializationTimeout: TimeInterval = 10,
+        sseInitializationTimeout: TimeInterval = 0.5,
+        waitForSessionId: Bool = true,
         requestModifier: @escaping (URLRequest) -> URLRequest = { $0 },
         logger: Logger? = nil
     ) {
@@ -114,11 +129,14 @@ public actor HTTPClientTransport: Transport {
         self.session = session
         self.streaming = streaming
         self.sseInitializationTimeout = sseInitializationTimeout
+        self.shouldWaitForSessionId = waitForSessionId
         self.requestModifier = requestModifier
 
-        // Create message stream
+        // Create message stream with bounded buffer to prevent unlimited accumulation
         var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
-        self.messageStream = AsyncThrowingStream { continuation = $0 }
+        self.messageStream = AsyncThrowingStream(
+            bufferingPolicy: .bufferingNewest(10)
+        ) { continuation = $0 }
         self.messageContinuation = continuation
 
         self.logger =
@@ -166,6 +184,34 @@ public actor HTTPClientTransport: Transport {
         }
 
         logger.debug("HTTP transport connected")
+    }
+
+    /// Creates an optimized URLSessionConfiguration for real-time SSE streaming
+    ///
+    /// This configuration is tuned for Server-Sent Events streaming scenarios where:
+    /// - Low latency delivery of notifications is critical
+    /// - Connections remain open for extended periods
+    /// - Real-time responsiveness is prioritized over caching
+    ///
+    /// Key optimizations:
+    /// - Caching is disabled to ensure real-time data delivery
+    /// - HTTP pipelining is disabled for better SSE compatibility
+    /// - Appropriate timeouts for long-lived connections
+    ///
+    /// - Returns: A URLSessionConfiguration optimized for SSE streaming
+    public static func optimizedStreamingConfiguration() -> URLSessionConfiguration {
+        let config = URLSessionConfiguration.default
+        // Disable caching for real-time data
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        // Disable HTTP pipelining for better SSE compatibility
+        config.httpShouldUsePipelining = false
+        // Set appropriate timeouts for long-lived connections
+        config.timeoutIntervalForRequest = 30  // 30 seconds for request transmission
+        config.timeoutIntervalForResource = 300  // 5 minutes for resource download (SSE is long-lived)
+        // Reasonable connection limits
+        config.httpMaximumConnectionsPerHost = 2
+        return config
     }
 
     /// Disconnects from the transport
@@ -404,8 +450,8 @@ public actor HTTPClientTransport: Transport {
             // This is the original code for platforms that support SSE
             guard isConnected else { return }
 
-            // Wait for the initial session ID signal, but only if sessionID isn't already set
-            if self.sessionID == nil, let signalTask = self.initialSessionIDSignalTask {
+            // Wait for the initial session ID signal, but only if sessionID isn't already set and if waitForSessionId is enabled
+            if shouldWaitForSessionId, self.sessionID == nil, let signalTask = self.initialSessionIDSignalTask {
                 logger.trace("SSE streaming task waiting for initial sessionID signal...")
 
                 // Race the signalTask against a timeout
@@ -451,6 +497,10 @@ public actor HTTPClientTransport: Transport {
                         "Timeout waiting for initial sessionID signal. SSE stream will proceed (sessionID might be nil)."
                     )
                 }
+            } else if !shouldWaitForSessionId, self.sessionID == nil {
+                logger.trace(
+                    "waitForSessionId is disabled. Proceeding immediately with SSE connection without waiting for session ID."
+                )
             } else if self.sessionID != nil {
                 logger.trace(
                     "Initial sessionID already available. Proceeding with SSE streaming task immediately."
