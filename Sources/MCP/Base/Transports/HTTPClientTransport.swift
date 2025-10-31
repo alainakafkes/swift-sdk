@@ -132,11 +132,11 @@ public actor HTTPClientTransport: Transport {
         self.shouldWaitForSessionId = waitForSessionId
         self.requestModifier = requestModifier
 
-        // Create message stream with unbuffered policy to ensure all messages are delivered
-        // Using unbounded buffering ensures no messages are dropped during high-throughput scenarios
+        // Create message stream with minimal buffering to minimize latency
+        // Size 1 means each message is delivered immediately without accumulation
         var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
         self.messageStream = AsyncThrowingStream(
-            bufferingPolicy: .unbounded
+            bufferingPolicy: .bufferingNewest(1)
         ) { continuation = $0 }
         self.messageContinuation = continuation
 
@@ -594,45 +594,45 @@ public actor HTTPClientTransport: Transport {
         /// - Throws: Error for stream processing failures
         private func processSSE(_ stream: URLSession.AsyncBytes) async throws {
             do {
-                var eventBuffer = ""
+                var buffer = Data()
                 var lineBuffer = ""
 
                 for try await byte in stream {
                     // Check if task has been cancelled
                     if Task.isCancelled { break }
 
-                    // Append byte to line buffer
-                    lineBuffer.append(Character(UnicodeScalar(byte)))
+                    buffer.append(byte)
 
                     // Check if we've received a complete line (ends with \n)
                     if byte == UInt8(ascii: "\n") {
-                        let trimmedLine = lineBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // Decode the line
+                        if let line = String(data: buffer, encoding: .utf8) {
+                            lineBuffer += line.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                        // Check if this is an empty line (event delimiter in SSE)
-                        if trimmedLine.isEmpty {
-                            // Empty line marks end of event
-                            if !eventBuffer.isEmpty {
-                                // Parse and yield the complete event
-                                if let eventData = try? parseSSEEventData(eventBuffer) {
-                                    logger.trace("SSE event parsed and delivered")
-                                    messageContinuation.yield(eventData)
+                            // Check if this line ends an SSE event (empty line means end of event)
+                            if lineBuffer.isEmpty || line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                if !lineBuffer.isEmpty {
+                                    // We have a complete event (lines preceding empty line)
+                                    // Parse and yield the event data
+                                    if let eventData = try? parseSSEEventData(lineBuffer) {
+                                        logger.trace("SSE event parsed and delivered immediately")
+                                        messageContinuation.yield(eventData)
+                                    }
+                                    lineBuffer = ""
                                 }
-                                eventBuffer = ""
                             }
-                        } else {
-                            // Non-empty line is part of the event
-                            eventBuffer.append(trimmedLine + "\n")
                         }
-
-                        lineBuffer = ""
+                        buffer = Data()
                     }
                 }
 
-                // Handle any remaining buffered event data
-                if !eventBuffer.isEmpty,
-                    let eventData = try? parseSSEEventData(eventBuffer) {
-                    logger.trace("SSE event from remaining buffer delivered")
-                    messageContinuation.yield(eventData)
+                // Handle any remaining buffered data
+                if !buffer.isEmpty || !lineBuffer.isEmpty {
+                    if !lineBuffer.isEmpty,
+                        let eventData = try? parseSSEEventData(lineBuffer) {
+                        logger.trace("SSE event from remaining buffer delivered")
+                        messageContinuation.yield(eventData)
+                    }
                 }
             } catch {
                 logger.error("Error processing SSE events: \(error)")
