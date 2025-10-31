@@ -132,11 +132,10 @@ public actor HTTPClientTransport: Transport {
         self.shouldWaitForSessionId = waitForSessionId
         self.requestModifier = requestModifier
 
-        // Create message stream with minimal buffering to minimize latency
-        // Size 1 means each message is delivered immediately without accumulation
+        // Create message stream with bounded buffer to prevent unlimited accumulation
         var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
         self.messageStream = AsyncThrowingStream(
-            bufferingPolicy: .bufferingNewest(1)
+            bufferingPolicy: .bufferingNewest(10)
         ) { continuation = $0 }
         self.messageContinuation = continuation
 
@@ -587,81 +586,31 @@ public actor HTTPClientTransport: Transport {
 
         /// Processes an SSE byte stream, extracting events and delivering them
         ///
-        /// This implementation processes raw bytes from the stream to minimize latency
-        /// and avoid buffering delays that can occur in higher-level SSE parsing libraries.
-        ///
         /// - Parameter stream: The URLSession.AsyncBytes stream to process
         /// - Throws: Error for stream processing failures
         private func processSSE(_ stream: URLSession.AsyncBytes) async throws {
             do {
-                var buffer = Data()
-                var lineBuffer = ""
-
-                for try await byte in stream {
+                for try await event in stream.events {
                     // Check if task has been cancelled
                     if Task.isCancelled { break }
 
-                    buffer.append(byte)
+                    logger.trace(
+                        "SSE event received",
+                        metadata: [
+                            "type": "\(event.event ?? "message")",
+                            "id": "\(event.id ?? "none")",
+                        ]
+                    )
 
-                    // Check if we've received a complete line (ends with \n)
-                    if byte == UInt8(ascii: "\n") {
-                        // Decode the line
-                        if let line = String(data: buffer, encoding: .utf8) {
-                            lineBuffer += line.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                            // Check if this line ends an SSE event (empty line means end of event)
-                            if lineBuffer.isEmpty || line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                if !lineBuffer.isEmpty {
-                                    // We have a complete event (lines preceding empty line)
-                                    // Parse and yield the event data
-                                    if let eventData = try? parseSSEEventData(lineBuffer) {
-                                        logger.trace("SSE event parsed and delivered immediately")
-                                        messageContinuation.yield(eventData)
-                                    }
-                                    lineBuffer = ""
-                                }
-                            }
-                        }
-                        buffer = Data()
-                    }
-                }
-
-                // Handle any remaining buffered data
-                if !buffer.isEmpty || !lineBuffer.isEmpty {
-                    if !lineBuffer.isEmpty,
-                        let eventData = try? parseSSEEventData(lineBuffer) {
-                        logger.trace("SSE event from remaining buffer delivered")
-                        messageContinuation.yield(eventData)
+                    // Convert the event data to Data and yield it to the message stream
+                    if !event.data.isEmpty, let data = event.data.data(using: .utf8) {
+                        messageContinuation.yield(data)
                     }
                 }
             } catch {
                 logger.error("Error processing SSE events: \(error)")
                 throw error
             }
-        }
-
-        /// Parses SSE event format and extracts the data field
-        /// SSE format: "data: <json>\n\n"
-        private func parseSSEEventData(_ eventLines: String) throws -> Data? {
-            var eventData: String? = nil
-
-            for line in eventLines.components(separatedBy: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if trimmed.hasPrefix("data:") {
-                    // Extract the data portion after "data: "
-                    let dataContent = String(trimmed.dropFirst(5))
-                        .trimmingCharacters(in: .whitespaces)
-                    eventData = dataContent
-                    break
-                }
-            }
-
-            if let eventData = eventData, !eventData.isEmpty,
-                let data = eventData.data(using: .utf8) {
-                return data
-            }
-
-            return nil
         }
     #endif
 }
