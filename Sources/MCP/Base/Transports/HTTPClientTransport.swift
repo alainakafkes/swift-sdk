@@ -135,7 +135,7 @@ public actor HTTPClientTransport: Transport {
         // Create message stream with bounded buffer to prevent unlimited accumulation
         var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
         self.messageStream = AsyncThrowingStream(
-            bufferingPolicy: .bufferingNewest(10)
+            bufferingPolicy: .unbounded
         ) { continuation = $0 }
         self.messageContinuation = continuation
 
